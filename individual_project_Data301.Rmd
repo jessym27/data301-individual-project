@@ -1,0 +1,352 @@
+---
+title: "Individual Project"
+output: html_document
+date: "2026-10-23"
+---
+
+```{r}
+library(tidyverse)
+
+pharmac <- read.csv("Data_ByTG2_Regional.csv")
+census  <- read.csv("census2023.csv")
+
+glimpse(pharmac)
+```
+
+
+```{r}
+glimpse(census)
+```
+```{r}
+antidep <- pharmac %>%
+  filter(TherapeuticGrp2 == "Antidepressants", District != "New Zealand")
+
+nrow(antidep)                 
+sum(antidep$NumPpl == "<6") 
+```
+```{r}
+antidep <- antidep %>%
+  mutate(NumPpl = as.numeric(NumPpl))
+```
+
+```{r}
+antidep <- antidep %>%
+  mutate(District = if_else(District %in% c("Capital & Coast", "Hutt Valley"),
+                            "Capital, Coast and Hutt Valley", District)) %>%
+  group_by(District, YearDisp) %>%
+  summarise(NumPpl = sum(NumPpl), .groups = "drop")
+
+nrow(antidep)        
+```
+
+```{r}
+census <- census %>%
+  filter(Area != "New Zealand") %>%
+  mutate(across(-Area, ~ as.numeric(gsub(",", "", .x)))) %>%
+  mutate(
+    Unemployment_Pct = Employment_Unemployed /
+      (Employment_FullTime + Employment_PartTime + Employment_Unemployed) * 100,
+    Age30to64_Pct = Age_30to64 / Population * 100
+  )
+```
+
+```{r}
+setdiff(antidep$District, census$Area)   
+
+model_data <- antidep %>%
+  left_join(census, by = c("District" = "Area")) %>%
+  mutate(
+    Patients_Per_1k = NumPpl / Population * 1000,
+    Year = factor(YearDisp)
+  )
+
+nrow(model_data)                          
+sum(is.na(model_data$Population))         
+head(model_data)
+```
+
+```{r}
+# How big are the rates do they change by year?
+model_data %>%
+  group_by(Year) %>%
+  summarise(Mean = mean(Patients_Per_1k),
+            Min  = min(Patients_Per_1k),
+            Max  = max(Patients_Per_1k))
+
+# row per district
+district_avg <- model_data %>%
+  group_by(District) %>%
+  summarise(Rate = mean(Patients_Per_1k),
+            Unemployment_Pct = first(Unemployment_Pct),
+            Age30to64_Pct = first(Age30to64_Pct))
+
+#which districts have the highest and lowest rates?
+ggplot(district_avg, aes(x = reorder(District, Rate), y = Rate)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = "District",
+       y = "Average antidepressant patients per 1,000 residents (2021-2025)")
+
+# rough first look
+ggplot(district_avg, aes(x = Unemployment_Pct, y = Rate)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  labs(x = "Unemployment rate (%)",
+       y = "Average antidepressant patients per 1,000 residents")
+
+# Are the two predictors too similar to each other?
+cor(district_avg$Unemployment_Pct, district_avg$Age30to64_Pct)
+summary(district_avg$Unemployment_Pct)
+summary(district_avg$Age30to64_Pct)
+```
+Model
+```{r}
+fit <- lm(Patients_Per_1k ~ Unemployment_Pct + Age30to64_Pct + Year, data = model_data)
+summary(fit)
+confint(fit)
+
+# correcting for the same district appearing in 5 years
+install.packages(c("sandwich", "lmtest"))
+library(sandwich); library(lmtest)
+coeftest(fit, vcov = vcovCL(fit, cluster = model_data$District))
+coefci(fit, vcov = vcovCL(fit, cluster = model_data$District))
+
+# Residual plot
+ggplot(data.frame(fitted = fitted(fit), resid = resid(fit)), aes(fitted, resid)) +
+  geom_point() + geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(x = "Fitted patient rate (per 1,000)", y = "Residual")
+
+# without Counties Manukau
+fit2 <- lm(Patients_Per_1k ~ Unemployment_Pct + Age30to64_Pct + Year,
+           data = filter(model_data, District != "Counties Manukau"))
+summary(fit2)
+```
+
+```{r}
+coeftest(fit, vcov = vcovCL(fit, cluster = model_data$District), df = 18)
+coefci(fit, vcov = vcovCL(fit, cluster = model_data$District), df = 18)
+```
+```{r}
+install.packages("lmerTest")
+library(lmerTest)
+summary(lmer(Patients_Per_1k ~ Unemployment_Pct + Age30to64_Pct + Year + (1 | District),
+             data = model_data))
+```
+
+```{r}
+mm <- lmer(Patients_Per_1k ~ Unemployment_Pct + Age30to64_Pct + Year + (1 | District),
+           data = model_data)
+cf <- summary(mm)$coefficients
+tab <- data.frame(
+  Estimate = cf[, "Estimate"],
+  SE       = cf[, "Std. Error"],
+  Lower    = cf[, "Estimate"] - qt(0.975, cf[, "df"]) * cf[, "Std. Error"],
+  Upper    = cf[, "Estimate"] + qt(0.975, cf[, "df"]) * cf[, "Std. Error"],
+  p        = cf[, "Pr(>|t|)"]
+)
+round(tab, 3)
+```
+
+```{r}
+med <- median(district_avg$Unemployment_Pct)
+
+trend <- model_data %>%
+  mutate(Group = ifelse(Unemployment_Pct > med,
+                        "Higher unemployment", "Lower unemployment")) %>%
+  group_by(Group, YearDisp) %>%
+  summarise(Rate = mean(Patients_Per_1k), .groups = "drop")
+
+p3 <- ggplot(trend, aes(YearDisp, Rate, linetype = Group, shape = Group)) +
+  geom_line() + geom_point(size = 2) +
+  labs(x = "Year", y = "Average antidepressant patients per 1,000 residents") +
+  theme_minimal()
+ggsave("trend_by_unemployment.png", p3, width = 6.5, height = 4.5, dpi = 300)
+```
+
+```{r}
+model_data <- model_data %>% mutate(YearNum = YearDisp - 2021)
+
+mm_int <- lmer(Patients_Per_1k ~ Unemployment_Pct * YearNum + Age30to64_Pct +
+                 (1 | District), data = model_data)
+summary(mm_int)
+```
+
+```{r}
+mm_slope <- lmer(Patients_Per_1k ~ Unemployment_Pct * YearNum + Age30to64_Pct +
+                   (1 + YearNum | District), data = model_data)
+summary(mm_slope)
+```
+```{r}
+mm_slope_main <- lmer(Patients_Per_1k ~ Unemployment_Pct + Age30to64_Pct + YearNum +
+                        (1 + YearNum | District), data = model_data)
+summary(mm_slope_main)
+confint(mm_slope_main, method = "Wald")
+```
+
+```{r}
+# Table 1 and Figure 1
+district_avg %>% summarise(Min = min(Rate), Median = median(Rate), Max = max(Rate))
+district_avg %>% arrange(Rate) %>% mutate(Rate = round(Rate, 1))
+
+# Figure 2
+trend %>% mutate(Rate = round(Rate, 1))
+
+# Table 2 intervals (main model)
+cf <- summary(mm_slope_main)$coefficients
+round(data.frame(Estimate = cf[,1], SE = cf[,2], df = cf[,3],
+  Lower = cf[,1] - qt(.975, cf[,3]) * cf[,2],
+  Upper = cf[,1] + qt(.975, cf[,3]) * cf[,2], p = cf[,5]), 3)
+
+# Interaction interval
+ci <- summary(mm_slope)$coefficients["Unemployment_Pct:YearNum", ]
+ci["Estimate"] + c(-1, 1) * qt(.975, ci["df"]) * ci["Std. Error"]
+
+# Does the district-trend model fit better?
+mm_ri <- lmer(Patients_Per_1k ~ Unemployment_Pct + Age30to64_Pct + YearNum +
+                (1 | District), data = model_data)
+anova(mm_ri, mm_slope_main)
+
+# Without Counties Manukau
+mm_cm <- lmer(Patients_Per_1k ~ Unemployment_Pct + Age30to64_Pct + YearNum +
+                (1 + YearNum | District),
+              data = filter(model_data, District != "Counties Manukau"))
+summary(mm_cm)$coefficients
+```
+
+```{r}
+cf <- summary(mm_cm)$coefficients["Unemployment_Pct", ] 
+cf["Estimate"] + c(-1, 1) * qt(.975, cf["df"]) * cf["Std. Error"]
+```
+
+```{r}
+p2 <- ggplot(data.frame(fitted = fitted(mm_slope_main), resid = resid(mm_slope_main)),
+             aes(fitted, resid)) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(x = "Fitted patient rate (per 1,000)", y = "Residual") +
+  theme_minimal()
+
+p2
+ggsave("residuals_mixed.png", p2, width = 6.5, height = 4.5, dpi = 300)
+```
+
+```{r}
+model_data %>%
+  mutate(Residual = resid(mm_slope_main)) %>%
+  arrange(desc(abs(Residual))) %>%
+  select(District, YearDisp, Residual) %>%
+  head(5)
+```
+
+nice looking graphs
+```{r}
+library(tidyverse)
+library(ggrepel)    
+
+# Palette (colour blind friendly)
+blue   <- "#0072B2"
+orange <- "#D55E00"
+navy   <- "#1F3B57"
+
+my_theme <- theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        axis.title  = element_text(colour = "grey20"),
+        axis.text   = element_text(colour = "grey25"),
+        legend.position = "bottom")
+
+district_avg <- district_avg %>%
+  mutate(District = recode(District, "Tairawhiti" = "Tāirawhiti"))
+
+# Figure 1
+p0 <- district_avg %>%
+  mutate(District = fct_reorder(District, Rate)) %>%
+  ggplot(aes(District, Rate, fill = Unemployment_Pct)) +
+  geom_col(width = 0.75) +
+  geom_text(aes(label = sprintf("%.0f", Rate)), hjust = -0.25,
+            size = 3.3, colour = "grey20") +
+  coord_flip() +
+  scale_fill_viridis_c(option = "mako", direction = -1, end = 0.85,
+                       name = "Unemployment rate (%)") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(x = NULL,
+       y = "Antidepressant patients per 1,000 residents (2021-2025 average)") +
+  my_theme +
+  theme(panel.grid.major.y = element_blank(),
+        legend.key.width = unit(1.6, "cm"))
+ggsave("district_rates_bar.png", p0, width = 6.5, height = 5, dpi = 300)
+
+# Figure 2: trend
+p3 <- ggplot(trend, aes(YearDisp, Rate, colour = Group,
+                        linetype = Group, shape = Group)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 3.2) +
+  geom_text(data = filter(trend, YearDisp %in% c(2021, 2025)),
+            aes(label = sprintf("%.1f", Rate)),
+            vjust = -1, size = 3.3, show.legend = FALSE) +
+  scale_colour_manual(values = c("Higher unemployment" = orange,
+                                 "Lower unemployment"  = blue)) +
+  scale_linetype_manual(values = c("Higher unemployment" = "solid",
+                                   "Lower unemployment"  = "longdash")) +
+  scale_shape_manual(values = c("Higher unemployment" = 16,
+                                "Lower unemployment"  = 17)) +
+  scale_x_continuous(breaks = 2021:2025) +
+  scale_y_continuous(limits = c(105, 150)) +
+  labs(x = "Year", y = "Average antidepressant patients per 1,000 residents",
+       colour = NULL, linetype = NULL, shape = NULL) +
+  my_theme
+ggsave("trend_by_unemployment.png", p3, width = 6.5, height = 4.5, dpi = 300)
+
+#Figure 3: scatterplot
+cm <- filter(district_avg, District == "Counties Manukau")
+
+p1 <- ggplot(district_avg, aes(Unemployment_Pct, Rate)) +
+  geom_smooth(method = "lm", formula = y ~ x, colour = blue,
+              fill = "#A6CEE3", alpha = 0.4, linewidth = 1) +
+  geom_point(colour = navy, size = 3) +
+  geom_point(data = cm, colour = orange, shape = 17, size = 4.5) +
+  geom_text(data = cm, aes(label = District), colour = orange,
+            hjust = 1, nudge_x = -0.1, size = 3.6) +
+  labs(x = "Unemployment rate (%)",
+       y = "Antidepressant patients per 1,000 residents (2021-2025 average)") +
+  my_theme
+ggsave("scatter_unemployment.png", p1, width = 6.5, height = 4.5, dpi = 300)
+
+# Figure 4
+resid_df <- model_data %>%
+  mutate(District = recode(District, "Tairawhiti" = "Tāirawhiti"),
+         fitted = fitted(mm_slope_main),
+         resid  = resid(mm_slope_main),
+         big    = rank(-abs(resid)) <= 5,
+         label  = paste(District, YearDisp))
+
+p2 <- ggplot(resid_df, aes(fitted, resid)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_point(data = filter(resid_df, !big), colour = blue,
+             size = 2.6, alpha = 0.8) +
+  geom_point(data = filter(resid_df, big), colour = orange,
+             shape = 17, size = 3.8) +
+  geom_text_repel(data = filter(resid_df, big), aes(label = label),
+                  size = 3.3, colour = "grey20", min.segment.length = 0) +
+  labs(x = "Fitted patient rate (per 1,000)", y = "Residual") +
+  my_theme
+ggsave("residuals_mixed.png", p2, width = 6.5, height = 4.5, dpi = 300)
+
+
+p0
+p1
+p2
+p3
+```
+
+```{r}
+# Figure 2
+p3b <- p3 + labs(y = "Average antidepressant patients\nper 1,000 residents")
+ggsave("trend_by_unemployment.png", p3b, width = 6.5, height = 5, dpi = 300)
+
+# Figure 3
+p1b <- p1 + labs(y = "Antidepressant patients per\n1,000 residents\n(2021-2025 average)")
+ggsave("scatter_unemployment.png", p1b, width = 6.5, height = 5, dpi = 300)
+```
+
+
+
